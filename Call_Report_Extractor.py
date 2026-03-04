@@ -21,8 +21,8 @@ st.set_page_config(
     page_icon="📄",
     layout="wide",
 )
-st.title("Call Report Data Extractor")
-st.caption("Select PDFs → Convert to HTML (via pdfplumber) → Extract account codes → Download Excel")
+st.title("📄 PDF → HTML → Excel (5300 Extractor)")
+st.caption("Select PDFs → Convert to HTML (via pdfplumber) → Extract account code + description + value → Download Excel")
 
 
 # ==============================
@@ -176,6 +176,25 @@ def parse_numeric(text: str):
         return -val if negative else val
     return text
 
+def is_numeric_like(text: Optional[str]) -> bool:
+    """Detect if a string looks numeric (for locating the Value column)."""
+    if text is None:
+        return False
+    s = str(text).strip()
+    if s == "":
+        return False
+    s = s.replace('(', '').replace(')', '')
+    s = s.replace('$', '').replace(',', '').strip()
+    return bool(re.fullmatch(r'[-+]?\d*\.?\d+', s))
+
+def clean_description(text: Optional[str]) -> str:
+    """Normalize description text without over-aggressive stripping."""
+    if text is None:
+        return "null"
+    t = str(text).strip()
+    # avoid collapsing meaningful hyphens or spaces; minimal cleanup
+    return t if t else "null"
+
 
 # ==============================
 # PDF → HTML (via pdfplumber), returning HTML string
@@ -216,13 +235,15 @@ def cached_pdf_to_html(name: str, file_bytes: bytes) -> str:
 
 
 # ==============================
-# HTML → rows (extract account/value pairs)
+# HTML → rows (extract Account, Description, Value)
 # ==============================
-def extract_rows_from_html(html: str) -> List[Tuple[str, object]]:
+def extract_rows_from_html(html: str) -> List[Tuple[str, str, object]]:
     """
-    From HTML, find any cells equal to known account codes.
-    For each code occurrence, capture the previous cell value (or 'null' if it's the first col).
-    Returns list of (Account, Value) with Value numeric-coerced when possible.
+    For each row in every table:
+      - Identify any cells equal to a known account code.
+      - Find the nearest numeric-looking cell to the LEFT = Value (parse to float when possible).
+      - Then find the nearest non-numeric, non-empty text cell to the LEFT of that value = Description.
+    Returns a list of tuples: (Account, Description, Value)
     """
     soup = BeautifulSoup(html, 'html.parser')  # built-in parser; no lxml required
     tables = soup.find_all('table')
@@ -230,7 +251,7 @@ def extract_rows_from_html(html: str) -> List[Tuple[str, object]]:
         return []
 
     codes_set = set(account_codes)  # O(1) membership checks
-    results: List[Tuple[str, object]] = []
+    results: List[Tuple[str, str, object]] = []
 
     for table in tables:
         for row in table.find_all('tr'):
@@ -242,19 +263,45 @@ def extract_rows_from_html(html: str) -> List[Tuple[str, object]]:
                 continue
 
             # Any account codes present in this row?
-            possible = set(row_text).intersection(codes_set)
-            if not possible:
+            possible_codes = set(row_text).intersection(codes_set)
+            if not possible_codes:
                 continue
 
-            # For each matched code, collect value from previous column (if exists)
-            for code in possible:
-                indices = [i for i, x in enumerate(row_text) if x == code]
-                for idx in indices:
-                    if idx > 0:
-                        prev_val = parse_numeric(row_text[idx - 1])
-                        results.append((code, prev_val))
-                    else:
-                        results.append((code, "null"))
+            # For each matched code, compute (Description, Value)
+            for code in possible_codes:
+                code_positions = [i for i, x in enumerate(row_text) if x == code]
+                for idx_code in code_positions:
+                    # --- Locate Value: nearest numeric-looking cell to the LEFT of the code
+                    value = "null"
+                    v_idx = None
+                    for j in range(idx_code - 1, -1, -1):
+                        if is_numeric_like(row_text[j]):
+                            v_idx = j
+                            value = parse_numeric(row_text[j])
+                            break
+                    # Fallback: if none numeric-looking to left, try immediate left (even if non-numeric)
+                    if v_idx is None and idx_code > 0:
+                        v_idx = idx_code - 1
+                        value = parse_numeric(row_text[v_idx])
+
+                    # --- Locate Description: nearest non-numeric cell LEFT of the value index
+                    description = "null"
+                    if v_idx is not None:
+                        for j in range(v_idx - 1, -1, -1):
+                            cell = row_text[j]
+                            if cell and (not is_numeric_like(cell)) and (cell not in codes_set):
+                                description = clean_description(cell)
+                                break
+                    # Fallbacks for Description when not found
+                    if description == "null":
+                        # Try immediate left of the code if it's descriptive text
+                        if idx_code > 0:
+                            cand = row_text[idx_code - 1]
+                            if cand and (not is_numeric_like(cand)) and (cand not in codes_set):
+                                description = clean_description(cand)
+
+                    results.append((code, description, value))
+
     return results
 
 
@@ -295,7 +342,7 @@ def build_excel_bytes(per_pdf_sheets: List[Tuple[str, pd.DataFrame]],
             if rows:
                 consolidated = pd.concat(rows, ignore_index=True)
             else:
-                consolidated = pd.DataFrame(columns=["Source", "Account", "Value"])
+                consolidated = pd.DataFrame(columns=["Source", "Account", "Description", "Value"])
             cons_name = make_unique_sheet_name("Consolidated", used_sheet_names)
             consolidated.to_excel(writer, sheet_name=cons_name, index=False)
 
@@ -310,7 +357,7 @@ def build_excel_bytes_for_single_sheet(df: pd.DataFrame,
                                        log_df: Optional[pd.DataFrame] = None) -> bytes:
     """
     Single-workbook for one PDF:
-      - Sheet 1: the extracted rows (Account, Value), named after the PDF (sanitized)
+      - Sheet 1: the extracted rows (Account, Description, Value), named after the PDF (sanitized)
       - Optional Sheet 2: Log (one-row log for that file)
     Caller controls the download filename to match the PDF base name.
     """
@@ -334,7 +381,6 @@ def zip_excels_per_pdf(per_pdf_sheets: List[Tuple[str, pd.DataFrame]],
     """
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # Build a mapping from file name to its log dict for quick lookup
         log_map = {log.get("file"): log for log in logs}
         for (pdf_name, df) in per_pdf_sheets:
             base = os.path.splitext(os.path.basename(pdf_name))[0] or "file"
@@ -373,7 +419,7 @@ with st.sidebar:
     )
     include_html_zip = st.checkbox("Also provide ZIP of generated HTML files", value=False)
     preview_rows = st.number_input("Preview rows per sheet", min_value=5, max_value=200, value=20, step=5)
-    st.caption("Note: Extractor matches cells equal to a known account code, capturing the **previous column** value.")
+    st.caption("Extractor: finds the nearest numeric to the left of each code as the Value, and the nearest non-numeric before that as the Description.")
 
 
 # ==============================
@@ -438,20 +484,19 @@ if run:
             html_cache.append((name, html_str))
             log["html_chars"] = len(html_str) if html_str else 0
 
-            # Extract rows
+            # Count tables for log
             soup = BeautifulSoup(html_str, 'html.parser')
             tables = soup.find_all('table')
             log["tables_found"] = len(tables)
 
-            rows = extract_rows_from_html(html_str)
-            log["rows_extracted"] = len(rows)
+            # Extract rows (Account, Description, Value)
+            rows_adv = extract_rows_from_html(html_str)
+            log["rows_extracted"] = len(rows_adv)
 
-            if rows:
-                df = pd.DataFrame(rows, columns=['Account', 'Value'])
+            if rows_adv:
+                df = pd.DataFrame(rows_adv, columns=['Account', 'Description', 'Value'])
                 per_pdf_sheets.append((name, df))
-            else:
-                # Match original behavior: skip empty sheets, but keep in log
-                pass
+            # else: match original behavior — skip empty sheet, but keep in log
 
         except Exception as e:
             log["status"] = "error"
@@ -478,7 +523,7 @@ if run:
     st.divider()
     st.subheader("Download")
 
-    # === Download logic based on your requested behavior ===
+    # === Download logic (includes your filename-matching behavior) ===
     if per_pdf_sheets:
         # A) Single PDF → name Excel exactly like the PDF
         if len(per_pdf_sheets) == 1 and not export_zip_per_pdf:
