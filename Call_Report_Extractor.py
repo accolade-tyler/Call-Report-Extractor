@@ -21,7 +21,7 @@ st.set_page_config(
     page_icon="📄",
     layout="wide",
 )
-st.title("📄 PDF → HTML → Excel (5300 Extractor)")
+st.title("Call Report Data Extractor")
 st.caption("Select PDFs → Convert to HTML (via pdfplumber) → Extract account codes → Download Excel")
 
 
